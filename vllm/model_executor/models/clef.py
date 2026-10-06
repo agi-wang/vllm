@@ -3,9 +3,11 @@
 """Clef decision model on the Qwen3.5 prefill path.
 
 Clef-flash is a Qwen3.5 backbone plus ``joint_head.safetensors``. The head
-mean-pools question and option spans from the full prefill hidden states and
-mixes them with output-embedding vectors. It does not decode tokens, so KV
-cache does not apply. Concurrent requests are batched prefills.
+is the published batched joint schema forward: it mean-pools question and
+option spans from the full prefill hidden states and mixes them with
+output-embedding vectors. It does not decode tokens, so KV cache does not
+apply. Concurrent requests are batched prefills. Every sequence that
+finishes in one step is scored by a single head call.
 
 Serve the published checkpoint with::
 
@@ -33,7 +35,12 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.pooler.abstract import Pooler
 from vllm.model_executor.layers.pooler.common import PoolingParamsUpdate
 from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
-from vllm.model_executor.models.clef_schema import JointSchemaHead
+from vllm.model_executor.models.clef_schema import (
+    EncodedRecord,
+    JointSchemaHead,
+    collate_finished,
+    record_from_question_dicts,
+)
 from vllm.model_executor.models.interfaces_base import default_pooling_type
 from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 from vllm.tasks import PoolingTask
@@ -60,9 +67,9 @@ def _joint_head_file(model: str, filename: str, revision: str | None) -> Path | 
 
 
 class ClefSchemaPooler(Pooler):
-    """Run the joint head once a sequence's hidden states are complete."""
+    """Score every sequence that finishes in this step with one head call."""
 
-    def __init__(self, score_fn: Callable[..., list[torch.Tensor]]) -> None:
+    def __init__(self, score_fn: Callable[..., list[list[torch.Tensor]]]) -> None:
         super().__init__()
         self.pooling = AllPool()
         # A bound method must not be registered as a child module.
@@ -84,12 +91,13 @@ class ClefSchemaPooler(Pooler):
     ) -> list[torch.Tensor | None]:
         sequences = self.pooling(hidden_states, pooling_metadata)
         token_rows = pooling_metadata.get_prompt_token_ids_cpu()
-        outputs: list[torch.Tensor | None] = []
-        for hidden, token_ids_cpu, params in zip(
-            sequences, token_rows, pooling_metadata.pooling_params
+        outputs: list[torch.Tensor | None] = [None] * len(sequences)
+        finished: list[tuple[torch.Tensor, torch.Tensor, EncodedRecord]] = []
+        finished_slots: list[int] = []
+        for index, (hidden, token_ids_cpu, params) in enumerate(
+            zip(sequences, token_rows, pooling_metadata.pooling_params)
         ):
             if hidden is None:
-                outputs.append(None)
                 continue
             extra = params.extra_kwargs or {}
             questions = extra.get("clef_questions")
@@ -101,12 +109,21 @@ class ClefSchemaPooler(Pooler):
                         "PoolingParams.extra_kwargs. Use POST /v1/systemone."
                     )
                 if hidden.shape[0] < 1:
-                    outputs.append(hidden.new_zeros((1,)))
+                    outputs[index] = hidden.new_zeros((1,))
                     continue
                 questions = [_WARMUP_QUESTION]
-            token_ids = token_ids_cpu.to(device=hidden.device, dtype=torch.long)
-            logits = self.score_fn(hidden, token_ids, questions)
-            outputs.append(torch.cat(logits, dim=0))
+            if token_ids_cpu is None:
+                raise RuntimeError("Clef scoring requires prompt token ids")
+            finished.append(
+                (hidden, token_ids_cpu, record_from_question_dicts(questions))
+            )
+            finished_slots.append(index)
+        if not finished:
+            return outputs
+        hidden_batch, input_ids, attention_mask, records = collate_finished(finished)
+        scored = self.score_fn(hidden_batch, input_ids, attention_mask, records)
+        for slot, logits in zip(finished_slots, scored):
+            outputs[slot] = torch.cat(logits, dim=0)
         return outputs
 
 
@@ -166,17 +183,20 @@ class ClefForDecision(Qwen3_5ForConditionalGeneration):
 
     def _score_questions(
         self,
-        sequence_hidden: torch.Tensor,
-        token_ids: torch.Tensor,
-        questions: list[dict[str, Any]],
-    ) -> list[torch.Tensor]:
-        hidden = sequence_hidden
-        if hidden.dtype != self.joint_head.hidden_norm.weight.dtype:
-            hidden = hidden.to(dtype=self.joint_head.hidden_norm.weight.dtype)
-        return self.joint_head.score_record(
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        records: list[EncodedRecord],
+    ) -> list[list[torch.Tensor]]:
+        hidden = hidden_states
+        head_dtype = self.joint_head.hidden_norm.weight.dtype
+        if hidden.dtype != head_dtype:
+            hidden = hidden.to(dtype=head_dtype)
+        return self.joint_head(
             hidden,
-            token_ids,
-            questions,
+            input_ids,
+            attention_mask,
+            records,
             self._output_embedding_weight(),
         )
 

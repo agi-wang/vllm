@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """``POST /v1/systemone`` for a Clef pooling model.
 
-The route encodes the record in the API process, sends token ids plus span
+The route encodes the record off the event loop, sends token ids plus span
 metadata through ``PoolingParams.extra_kwargs``, and formats the worker's
-concatenated logits. Request bodies are not logged.
+concatenated logits. vLLM batches the prefills. The worker scores every
+sequence that finishes in a step with one published joint-head call.
+Request bodies are not logged.
 """
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from http import HTTPStatus
 from typing import Any
@@ -78,12 +81,17 @@ async def create_systemone(request: SystemOneRequest, raw_request: Request):
             )
         if engine.model_config.runner_type != "pooling":
             raise RuntimeError("Clef /v1/systemone requires the pooling runner")
-        tokenizer = engine.renderer.get_tokenizer()
-        encoded = encode_record(
-            tokenizer,
-            payload,
-            max_length=engine.model_config.max_model_len,
-        )
+        executor = getattr(engine.renderer, "_executor", None)
+
+        def _encode():
+            tokenizer = engine.renderer.get_tokenizer()
+            return encode_record(
+                tokenizer,
+                payload,
+                max_length=engine.model_config.max_model_len,
+            )
+
+        encoded = await asyncio.get_running_loop().run_in_executor(executor, _encode)
         pooling_params = PoolingParams(
             task="token_classify",
             use_activation=False,

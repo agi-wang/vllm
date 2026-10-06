@@ -155,3 +155,43 @@ def test_joint_head_returns_one_logit_vector_per_question():
         embed,
     )
     assert torch.equal(torch.cat(logits), torch.cat(again))
+
+
+def test_padded_batch_matches_separate_records():
+    torch.manual_seed(1)
+    head = clef_schema.JointSchemaHead(
+        hidden_size=8,
+        width=8,
+        routing_layers=1,
+        layers=1,
+        heads=2,
+        feedforward=16,
+    ).eval()
+    encoded = clef_schema.encode_record(_CharTokenizer(), _record(), max_length=4096)
+    questions = [question.as_extra() for question in encoded.questions]
+    length = len(encoded.input_ids)
+    last = max(
+        end for question in encoded.questions for _, end in question.option_spans
+    )
+    assert 0 < last < length
+    hidden_a = torch.randn(length, 8)
+    hidden_b = torch.randn(last, 8)
+    ids_a = torch.tensor(encoded.input_ids)
+    ids_b = torch.tensor(encoded.input_ids[:last])
+    embed = torch.randn(512, 8)
+    single_a = head.score_record(hidden_a, ids_a, questions, embed)
+    single_b = head.score_record(hidden_b, ids_b, questions, embed)
+    hidden, ids, mask, records = clef_schema.collate_finished(
+        [
+            (hidden_a, ids_a, clef_schema.record_from_question_dicts(questions)),
+            (hidden_b, ids_b, clef_schema.record_from_question_dicts(questions)),
+        ]
+    )
+    assert hidden.shape == (2, length, 8)
+    assert int(mask[0].sum()) == length
+    assert int(mask[1].sum()) == last
+    batched = head(hidden, ids, mask, records, embed)
+    for left, right in zip(single_a, batched[0]):
+        assert torch.equal(left, right)
+    for left, right in zip(single_b, batched[1]):
+        assert torch.equal(left, right)

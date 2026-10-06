@@ -76,10 +76,78 @@ class EncodedRecord:
 
 
 def _tokens(tokenizer: Any, text: str) -> list[int]:
+    """Tokenize the way the published encoder does.
+
+    clef-flash calls ``tokenizer(text, add_special_tokens=False)`` and reads
+    ``input_ids``. Objects that are not callable keep the ``encode`` path so
+    a test double can stand in for that call.
+    """
+    if callable(tokenizer):
+        encoded = tokenizer(text, add_special_tokens=False)
+        ids = getattr(encoded, "input_ids", None)
+        if ids is None:
+            ids = encoded["input_ids"]
+        return [int(token) for token in ids]
     encoded = tokenizer.encode(text, add_special_tokens=False)
     if hasattr(encoded, "ids"):
         return [int(token) for token in encoded.ids]
     return [int(token) for token in encoded]
+
+
+def record_from_question_dicts(questions: list[dict[str, Any]]) -> EncodedRecord:
+    """Rebuild the span objects ``JointSchemaHead.forward`` indexes."""
+    encoded = tuple(
+        EncodedQuestion(
+            question_id="",
+            question_type=int(question["question_type"]),
+            question_span=(
+                int(question["question_span"][0]),
+                int(question["question_span"][1]),
+            ),
+            option_spans=tuple(
+                (int(start), int(end)) for start, end in question["option_spans"]
+            ),
+            option_ids=tuple("" for _ in question["option_spans"]),
+        )
+        for question in questions
+    )
+    return EncodedRecord(input_ids=(), questions=encoded, record_id="")
+
+
+def collate_finished(
+    sequences: list[tuple[torch.Tensor, torch.Tensor, EncodedRecord]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[EncodedRecord]]:
+    """Pad finished sequences into one batch for the published head.
+
+    Zeros sit past the attention mask. The head slices each row with
+    ``attention_mask.sum()`` before it reads a span, so the pad is unused.
+    """
+    if not sequences:
+        raise ValueError("at least one finished sequence is required")
+    lengths = [int(hidden.shape[0]) for hidden, _, _ in sequences]
+    width = max(lengths)
+    hidden_size = int(sequences[0][0].shape[-1])
+    device = sequences[0][0].device
+    hidden_states = sequences[0][0].new_zeros((len(sequences), width, hidden_size))
+    input_ids = torch.zeros((len(sequences), width), dtype=torch.long, device=device)
+    attention_mask = torch.zeros(
+        (len(sequences), width),
+        dtype=torch.long,
+        device=device,
+    )
+    records: list[EncodedRecord] = []
+    for index, (hidden, tokens, record) in enumerate(sequences):
+        length = lengths[index]
+        if int(tokens.shape[0]) != length:
+            raise ValueError(
+                f"token ids ({int(tokens.shape[0])}) do not match "
+                f"hidden states ({length})"
+            )
+        hidden_states[index, :length] = hidden
+        input_ids[index, :length] = tokens.to(device=device, dtype=torch.long)
+        attention_mask[index, :length] = 1
+        records.append(record)
+    return hidden_states, input_ids, attention_mask, records
 
 
 def validate_systemone_request(request: dict[str, Any]) -> None:
@@ -374,15 +442,127 @@ class JointSchemaHead(torch.nn.Module):
         self.residual_gate = torch.nn.Parameter(torch.zeros(()))
 
     @staticmethod
-    def _mean_span(
-        values: torch.Tensor, span: tuple[int, int] | list[int]
-    ) -> torch.Tensor:
-        start, end = int(span[0]), int(span[1])
-        if end <= start or end > values.shape[0]:
-            raise ValueError(
-                f"span {(start, end)} is outside a sequence of {values.shape[0]}"
-            )
+    def _mean_span(values: torch.Tensor, span: tuple[int, int]) -> torch.Tensor:
+        start, end = span
         return values[start:end].mean(dim=0)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        records: list[EncodedRecord],
+        output_embedding_weight: torch.Tensor,
+    ) -> list[list[torch.Tensor]]:
+        """Score a padded batch. This is the published clef-flash joint head."""
+        results: list[list[torch.Tensor]] = []
+        normalized_hidden = self.hidden_norm(hidden_states)
+        for batch_index, record in enumerate(records):
+            sequence_length = int(attention_mask[batch_index].sum().item())
+            sequence_hidden = normalized_hidden[batch_index, :sequence_length]
+            memory = self.memory_projection(sequence_hidden).unsqueeze(0)
+            global_vector = sequence_hidden[-1]
+            question_vectors = torch.stack(
+                [
+                    self._mean_span(sequence_hidden, question.question_span)
+                    for question in record.questions
+                ]
+            )
+            type_ids = torch.tensor(
+                [question.question_type for question in record.questions],
+                device=hidden_states.device,
+            )
+            option_contexts: list[torch.Tensor] = []
+            lexical_options: list[torch.Tensor] = []
+            option_counts = []
+            for question in record.questions:
+                context_vectors = torch.stack(
+                    [
+                        self._mean_span(sequence_hidden, span)
+                        for span in question.option_spans
+                    ]
+                )
+                lexical_vectors = []
+                for start, end in question.option_spans:
+                    token_ids = input_ids[batch_index, start:end]
+                    lexical_vectors.append(
+                        output_embedding_weight[token_ids].mean(dim=0)
+                    )
+                lexical = torch.stack(lexical_vectors)
+                option_contexts.append(context_vectors)
+                lexical_options.append(lexical)
+                option_counts.append(len(question.option_spans))
+
+            option_queries = []
+            for question_index, (context_vectors, lexical) in enumerate(
+                zip(option_contexts, lexical_options)
+            ):
+                option_queries.append(
+                    self.option_context_projection(context_vectors)
+                    + self.option_lexical_projection(lexical)
+                    + self.option_question_projection(
+                        question_vectors[question_index]
+                    ).unsqueeze(0)
+                )
+            routed_options = torch.cat(option_queries, dim=0).unsqueeze(0)
+            for layer in self.evidence_layers:
+                routed_options = layer(routed_options, memory)
+            routed_options = routed_options[0]
+            split_options = list(torch.split(routed_options, option_counts, dim=0))
+
+            base_fields = self.question_projection(question_vectors)
+            option_summaries = []
+            for field, options in zip(base_fields, split_options):
+                routing_weights = torch.softmax(
+                    torch.matmul(options, field) / math.sqrt(options.shape[-1]),
+                    dim=0,
+                )
+                option_summaries.append(
+                    torch.sum(routing_weights.unsqueeze(-1) * options, dim=0)
+                )
+            fields = (
+                base_fields
+                + self.option_summary_norm(torch.stack(option_summaries))
+                + self.global_projection(global_vector).unsqueeze(0)
+                + self.type_embedding(type_ids)
+            )
+            fields = fields.unsqueeze(0)
+            for layer in self.layers:
+                fields = layer(fields, memory)
+            fields = self.field_norm(fields[0])
+
+            record_logits: list[torch.Tensor] = []
+            for field, question, lexical, routed in zip(
+                fields,
+                record.questions,
+                lexical_options,
+                split_options,
+            ):
+                anchor = functional.normalize(
+                    question_vectors[len(record_logits)] + global_vector,
+                    dim=-1,
+                )
+                lexical_anchor = functional.normalize(lexical, dim=-1)
+                prior_scale = self.prior_logit_scale.clamp(max=math.log(100.0)).exp()
+                prior = prior_scale * torch.matmul(lexical_anchor, anchor)
+                options = self.option_norm(routed)
+                repeated_field = field.unsqueeze(0).expand_as(options)
+                cosine = functional.cosine_similarity(repeated_field, options, dim=-1)
+                features = torch.cat(
+                    [
+                        repeated_field,
+                        options,
+                        repeated_field * options,
+                        torch.abs(repeated_field - options),
+                    ],
+                    dim=-1,
+                )
+                residual = self.residual_scorer(features).squeeze(-1)
+                joint_scale = self.joint_logit_scale.clamp(max=math.log(100.0)).exp()
+                joint = joint_scale * cosine + residual
+                record_logits.append(prior + torch.sigmoid(self.residual_gate) * joint)
+            results.append(record_logits)
+        return results
 
     def score_record(
         self,
@@ -391,125 +571,20 @@ class JointSchemaHead(torch.nn.Module):
         questions: list[dict[str, Any]],
         output_embedding_weight: torch.Tensor,
     ) -> list[torch.Tensor]:
-        """Score one unpadded sequence.
-
-        ``sequence_hidden`` is ``[seq_len, hidden]`` and ``token_ids`` is
-        ``[seq_len]``. The embedding rows are the untied output embeddings.
-        """
-        if sequence_hidden.ndim != 2:
-            raise ValueError(
-                "sequence hidden states must be rank 2, "
-                f"got {tuple(sequence_hidden.shape)}"
-            )
-        if token_ids.shape[0] != sequence_hidden.shape[0]:
-            raise ValueError(
-                "token ids "
-                f"({token_ids.shape[0]}) do not match hidden states "
-                f"({sequence_hidden.shape[0]})"
-            )
-        if not questions:
-            raise ValueError("at least one question is required")
-
-        normalized_hidden = self.hidden_norm(sequence_hidden)
-        memory = self.memory_projection(normalized_hidden).unsqueeze(0)
-        global_vector = normalized_hidden[-1]
-        question_vectors = torch.stack(
+        """Score one unpadded sequence through the published batched forward."""
+        hidden, ids, mask, records = collate_finished(
             [
-                self._mean_span(normalized_hidden, question["question_span"])
-                for question in questions
+                (
+                    sequence_hidden,
+                    token_ids,
+                    record_from_question_dicts(questions),
+                )
             ]
         )
-        type_ids = torch.tensor(
-            [int(question["question_type"]) for question in questions],
-            device=sequence_hidden.device,
-            dtype=torch.long,
-        )
-        option_contexts: list[torch.Tensor] = []
-        lexical_options: list[torch.Tensor] = []
-        option_counts: list[int] = []
-        embed_weight = output_embedding_weight
-        for question in questions:
-            spans = question["option_spans"]
-            context_vectors = torch.stack(
-                [self._mean_span(normalized_hidden, span) for span in spans]
-            )
-            lexical_vectors = []
-            for start, end in spans:
-                ids = token_ids[int(start) : int(end)]
-                if int(ids.max()) >= embed_weight.shape[0]:
-                    raise ValueError(
-                        "option token id is outside the output embedding table"
-                    )
-                rows = embed_weight[ids].to(dtype=sequence_hidden.dtype)
-                lexical_vectors.append(rows.mean(dim=0))
-            lexical = torch.stack(lexical_vectors)
-            option_contexts.append(context_vectors)
-            lexical_options.append(lexical)
-            option_counts.append(len(spans))
-
-        option_queries = []
-        for question_index, (context_vectors, lexical) in enumerate(
-            zip(option_contexts, lexical_options)
-        ):
-            option_queries.append(
-                self.option_context_projection(context_vectors)
-                + self.option_lexical_projection(lexical)
-                + self.option_question_projection(
-                    question_vectors[question_index]
-                ).unsqueeze(0)
-            )
-        routed_options = torch.cat(option_queries, dim=0).unsqueeze(0)
-        for layer in self.evidence_layers:
-            routed_options = layer(routed_options, memory)
-        routed_options = routed_options[0]
-        split_options = list(torch.split(routed_options, option_counts, dim=0))
-
-        base_fields = self.question_projection(question_vectors)
-        option_summaries = []
-        for field, options in zip(base_fields, split_options):
-            routing_weights = torch.softmax(
-                torch.matmul(options, field) / math.sqrt(options.shape[-1]),
-                dim=0,
-            )
-            option_summaries.append(
-                torch.sum(routing_weights.unsqueeze(-1) * options, dim=0)
-            )
-        fields = (
-            base_fields
-            + self.option_summary_norm(torch.stack(option_summaries))
-            + self.global_projection(global_vector).unsqueeze(0)
-            + self.type_embedding(type_ids)
-        )
-        fields = fields.unsqueeze(0)
-        for layer in self.layers:
-            fields = layer(fields, memory)
-        fields = self.field_norm(fields[0])
-
-        record_logits: list[torch.Tensor] = []
-        for index, (field, lexical, routed) in enumerate(
-            zip(fields, lexical_options, split_options)
-        ):
-            anchor = functional.normalize(
-                question_vectors[index] + global_vector,
-                dim=-1,
-            )
-            lexical_anchor = functional.normalize(lexical, dim=-1)
-            prior_scale = self.prior_logit_scale.clamp(max=math.log(100.0)).exp()
-            prior = prior_scale * torch.matmul(lexical_anchor, anchor)
-            options = self.option_norm(routed)
-            repeated_field = field.unsqueeze(0).expand_as(options)
-            cosine = functional.cosine_similarity(repeated_field, options, dim=-1)
-            features = torch.cat(
-                [
-                    repeated_field,
-                    options,
-                    repeated_field * options,
-                    torch.abs(repeated_field - options),
-                ],
-                dim=-1,
-            )
-            residual = self.residual_scorer(features).squeeze(-1)
-            joint_scale = self.joint_logit_scale.clamp(max=math.log(100.0)).exp()
-            joint = joint_scale * cosine + residual
-            record_logits.append(prior + torch.sigmoid(self.residual_gate) * joint)
-        return record_logits
+        return self.forward(
+            hidden,
+            ids,
+            mask,
+            records,
+            output_embedding_weight,
+        )[0]
