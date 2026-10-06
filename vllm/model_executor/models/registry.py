@@ -594,6 +594,7 @@ _MULTIMODAL_MODELS = {
         "Qwen3VLMoeForConditionalGeneration",
     ),
     "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+    "ClefForDecision": ("clef", "ClefForDecision"),
     "Qwen3_5MoeForConditionalGeneration": (
         "qwen3_5",
         "Qwen3_5MoeForConditionalGeneration",

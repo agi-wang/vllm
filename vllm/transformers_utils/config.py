@@ -956,6 +956,22 @@ def get_config(
                     scale_fmt,
                 )
 
+    # Clef publishes the Qwen3.5 architecture and keeps the decision head in
+    # joint_head_config.json. Select Clef before user overrides so an explicit
+    # architectures override can still request the backbone alone.
+    if file_or_path_exists(model, "joint_head_config.json", revision):
+        from vllm.transformers_utils.clef import clef_architecture_override
+
+        clef_architectures = clef_architecture_override(
+            list(getattr(config, "architectures", None) or [])
+        )
+        if clef_architectures is not None:
+            logger.info(
+                "Found joint_head_config.json; selecting architecture %s.",
+                clef_architectures[0],
+            )
+            config.update({"architectures": clef_architectures})
+
     if hf_overrides_kw:
         logger.debug("Overriding HF config with %s", hf_overrides_kw)
         config.update(hf_overrides_kw)
