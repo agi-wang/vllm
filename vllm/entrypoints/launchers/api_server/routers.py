@@ -19,8 +19,11 @@ def register_api_routers(
 
     register_vllm_serve_api_routers(app)
 
-    if model_config is not None and "ClefForDecision" in (
-        model_config.architectures or []
+    from vllm.model_executor.models.decision_heads import SYSTEMONE_ARCHITECTURES
+
+    if model_config is not None and any(
+        architecture in SYSTEMONE_ARCHITECTURES
+        for architecture in (model_config.architectures or [])
     ):
         from vllm.entrypoints.serve.systemone.api_router import (
             attach_router as attach_systemone_router,

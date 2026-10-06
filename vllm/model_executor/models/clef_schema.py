@@ -162,7 +162,7 @@ def validate_systemone_request(request: dict[str, Any]) -> None:
         raise ValueError("model and state are required")
     if request.get("images") or request.get("videos"):
         raise NotImplementedError(
-            "this Clef build scores text only; images and videos are not accepted"
+            "this build scores text only; images and videos are not accepted"
         )
     if not isinstance(questions, dict) or not questions:
         raise ValueError("at least one question is required")

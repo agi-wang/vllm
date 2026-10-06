@@ -892,19 +892,43 @@ def get_config(
 
             raise ValueError(error_message) from e
 
-    config_parser = get_config_parser(config_format)
-    # Retry to tolerate a concurrent HF cache refresh briefly hiding config.json.
-    config_dict, config = with_retry(
-        lambda: config_parser.parse(
-            model,
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            code_revision=code_revision,
-            hf_overrides=hf_overrides_kw or hf_overrides_fn,
-            **kwargs,
-        ),
-        f"Error parsing config for {model}",
+    from vllm.transformers_utils.decision_config import (
+        NESTED_BACKBONE_CONFIG,
+        detect_decision,
+        load_nested_backbone_config,
     )
+
+    # Laya and Decision 2.0 root configs are wrappers. Load the backbone
+    # config before the parser, which rejects those model types. Clef stays
+    # on its own marker and is applied after a normal parse.
+    decision_arch, decision_names = detect_decision(str(model), revision)
+    has_clef_head = file_or_path_exists(model, "joint_head_config.json", revision)
+    if not has_clef_head and decision_arch in NESTED_BACKBONE_CONFIG:
+        logger.info(
+            "Found decision markers; loading %s for %s.",
+            NESTED_BACKBONE_CONFIG[decision_arch],
+            decision_arch,
+        )
+        config_dict, config = load_nested_backbone_config(
+            str(model),
+            revision,
+            decision_arch,
+            decision_names,
+        )
+    else:
+        config_parser = get_config_parser(config_format)
+        # Retry to tolerate a concurrent HF cache refresh briefly hiding config.json.
+        config_dict, config = with_retry(
+            lambda: config_parser.parse(
+                model,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+                code_revision=code_revision,
+                hf_overrides=hf_overrides_kw or hf_overrides_fn,
+                **kwargs,
+            ),
+            f"Error parsing config for {model}",
+        )
 
     # Architecture mapping for models without explicit architectures field
     if not config.architectures:
@@ -971,6 +995,15 @@ def get_config(
                 clef_architectures[0],
             )
             config.update({"architectures": clef_architectures})
+            decision_arch = None
+
+    # Kev, Lev, and Nimble keep a normal backbone config plus a marker file.
+    # An explicit architectures override below can still replace this.
+    if decision_arch is not None and decision_arch not in (
+        list(getattr(config, "architectures", None) or [])
+    ):
+        logger.info("Selecting decision architecture %s.", decision_arch)
+        config.update({"architectures": [decision_arch]})
 
     if hf_overrides_kw:
         logger.debug("Overriding HF config with %s", hf_overrides_kw)

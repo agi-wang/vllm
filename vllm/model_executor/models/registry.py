@@ -595,6 +595,12 @@ _MULTIMODAL_MODELS = {
     ),
     "Qwen3_5ForConditionalGeneration": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
     "ClefForDecision": ("clef", "ClefForDecision"),
+    "LayaTypedDecisions": ("laya_decision", "LayaForDecision"),
+    "KevForDecision": ("kev_decision", "KevForDecision"),
+    "LevForDecision": ("label_decision", "LabelDecisionModel"),
+    "NimbleForDecision": ("label_decision", "LabelDecisionModel"),
+    "OpenJevForDecision": ("label_decision", "OpenJevForDecision"),
+    "Decision2Model": ("decision2", "Decision2ForDecision"),
     "Qwen3_5MoeForConditionalGeneration": (
         "qwen3_5",
         "Qwen3_5MoeForConditionalGeneration",

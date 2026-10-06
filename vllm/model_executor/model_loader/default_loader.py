@@ -46,6 +46,11 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+# Decision 2.0 publishes the candidate head at the repo root and the text
+# weights under backbone/. The root glob is not recursive.
+_DECISION2_HEAD_FILE = "decision_head.safetensors"
+_DECISION2_INDEX_NAME = "model.safetensors.index.json"
+
 
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
@@ -244,12 +249,83 @@ class DefaultModelLoader(BaseModelLoader):
         else:
             hf_weights_files = filter_files_not_needed_for_inference(hf_weights_files)
 
+        if use_safetensors:
+            hf_folder, hf_weights_files, index_file = self._maybe_decision2_backbone(
+                hf_folder,
+                hf_weights_files,
+                index_file,
+                model_name_or_path,
+                revision,
+                is_local,
+            )
+
         if len(hf_weights_files) == 0:
             raise RuntimeError(
                 f"Cannot find any model weights with `{model_name_or_path}`"
             )
 
         return hf_folder, hf_weights_files, use_safetensors, index_file
+
+    def _maybe_decision2_backbone(
+        self,
+        hf_folder: str,
+        hf_weights_files: list[str],
+        index_file: str,
+        model_name_or_path: str,
+        revision: str | None,
+        is_local: bool,
+    ) -> tuple[str, list[str], str]:
+        """Use ``backbone/`` when the root safetensors file is only the head."""
+
+        basenames = {os.path.basename(path) for path in hf_weights_files}
+        only_head = not hf_weights_files or basenames <= {_DECISION2_HEAD_FILE}
+        if not only_head:
+            return hf_folder, hf_weights_files, index_file
+        if (
+            not is_local
+            and _DECISION2_HEAD_FILE in basenames
+            and not os.path.isfile(
+                os.path.join(hf_folder, "backbone", _DECISION2_INDEX_NAME)
+            )
+        ):
+            self._download_decision2_backbone(model_name_or_path, revision)
+        from vllm.model_executor.models.decision_heads import (
+            decision2_backbone_files,
+        )
+
+        nested = decision2_backbone_files(hf_folder)
+        if not nested:
+            return hf_folder, hf_weights_files, index_file
+        logger.info("Loading Decision 2.0 text weights from %s/backbone", hf_folder)
+        return (
+            os.path.join(hf_folder, "backbone"),
+            nested,
+            _DECISION2_INDEX_NAME,
+        )
+
+    def _download_decision2_backbone(
+        self,
+        model_name_or_path: str,
+        revision: str | None,
+    ) -> None:
+        import huggingface_hub
+
+        from vllm.transformers_utils.repo_utils import hf_api
+
+        try:
+            hf_api().snapshot_download(
+                repo_id=model_name_or_path,
+                allow_patterns=["backbone/*"],
+                cache_dir=self.load_config.download_dir,
+                revision=revision,
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            )
+        except Exception as exc:
+            logger.info(
+                "No Decision 2.0 backbone beside %s (%s)",
+                model_name_or_path,
+                exc,
+            )
 
     def _get_weights_iterator(
         self, source: Source

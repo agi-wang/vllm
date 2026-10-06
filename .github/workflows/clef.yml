@@ -37,23 +37,53 @@ jobs:
         run: |
           ruff check \
             vllm/transformers_utils/clef.py \
+            vllm/transformers_utils/decision_config.py \
             vllm/model_executor/models/clef.py \
             vllm/model_executor/models/clef_schema.py \
+            vllm/model_executor/models/decision_heads.py \
+            vllm/model_executor/models/decision_runtime.py \
+            vllm/model_executor/models/laya_decision.py \
+            vllm/model_executor/models/decision2.py \
+            vllm/model_executor/models/kev_decision.py \
+            vllm/model_executor/models/label_decision.py \
             vllm/entrypoints/serve/systemone \
-            tests/models/test_clef_schema.py
+            tests/models/test_clef_schema.py \
+            tests/models/test_hot_decision_models.py
           ruff format --check \
             vllm/transformers_utils/clef.py \
+            vllm/transformers_utils/decision_config.py \
             vllm/model_executor/models/clef.py \
             vllm/model_executor/models/clef_schema.py \
+            vllm/model_executor/models/decision_heads.py \
+            vllm/model_executor/models/decision_runtime.py \
+            vllm/model_executor/models/laya_decision.py \
+            vllm/model_executor/models/decision2.py \
+            vllm/model_executor/models/kev_decision.py \
+            vllm/model_executor/models/label_decision.py \
             vllm/entrypoints/serve/systemone \
-            tests/models/test_clef_schema.py
-      - name: Test the joint schema head
-        run: python -m pytest tests/models/test_clef_schema.py -q --noconftest
+            tests/models/test_clef_schema.py \
+            tests/models/test_hot_decision_models.py
+      - name: Test the decision heads
+        run: |
+          python -m pytest \
+            tests/models/test_clef_schema.py \
+            tests/models/test_hot_decision_models.py \
+            -q --noconftest
       - name: Syntax-check the vLLM integration modules
         run: |
           python -m py_compile \
             vllm/transformers_utils/clef.py \
+            vllm/transformers_utils/decision_config.py \
+            vllm/transformers_utils/config.py \
             vllm/model_executor/models/clef.py \
             vllm/model_executor/models/clef_schema.py \
+            vllm/model_executor/models/decision_heads.py \
+            vllm/model_executor/models/decision_runtime.py \
+            vllm/model_executor/models/laya_decision.py \
+            vllm/model_executor/models/decision2.py \
+            vllm/model_executor/models/kev_decision.py \
+            vllm/model_executor/models/label_decision.py \
+            vllm/model_executor/model_loader/default_loader.py \
+            vllm/entrypoints/launchers/api_server/routers.py \
             vllm/entrypoints/serve/systemone/__init__.py \
             vllm/entrypoints/serve/systemone/api_router.py
